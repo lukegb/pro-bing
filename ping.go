@@ -49,7 +49,6 @@
 // it calls the OnFinish callback.
 //
 // For a full ping example, see "cmd/ping/ping.go".
-//
 package probing
 
 import (
@@ -88,14 +87,15 @@ var (
 func New(addr string) *Pinger {
 	r := rand.New(rand.NewSource(getSeed()))
 	firstUUID := uuid.New()
-	var firstSequence = map[uuid.UUID]map[int]struct{}{}
-	firstSequence[firstUUID] = make(map[int]struct{})
+	var firstSequence = map[uuid.UUID]map[int]time.Time{}
+	firstSequence[firstUUID] = make(map[int]time.Time)
 	return &Pinger{
-		Count:      -1,
-		Interval:   time.Second,
-		RecordRtts: true,
-		Size:       timeSliceLength + trackerLength,
-		Timeout:    time.Duration(math.MaxInt64),
+		Count:         -1,
+		Interval:      time.Second,
+		RecordRtts:    true,
+		Size:          timeSliceLength + trackerLength,
+		Timeout:       time.Duration(math.MaxInt64),
+		PacketTimeout: time.Duration(5 * time.Second),
 
 		addr:              addr,
 		done:              make(chan interface{}),
@@ -134,8 +134,15 @@ type Pinger struct {
 	// Debug runs in debug mode
 	Debug bool
 
+	// PacketTimeout specifies how long to wait for a response before
+	// considering a packet lost.
+	PacketTimeout time.Duration
+
 	// Number of packets sent
 	PacketsSent int
+
+	// Number of packets expected to have been received (i.e. those actually received, or those which have timed out)
+	PacketsExpectedRecv int
 
 	// Number of packets received
 	PacketsRecv int
@@ -196,7 +203,7 @@ type Pinger struct {
 	id       int
 	sequence int
 	// awaitingSequences are in-flight sequence numbers we keep track of to help remove duplicate receipts
-	awaitingSequences map[uuid.UUID]map[int]struct{}
+	awaitingSequences map[uuid.UUID]map[int]time.Time
 	// network is one of "ip", "ip4", or "ip6".
 	network string
 	// protocol is "icmp" or "udp".
@@ -243,6 +250,9 @@ type Statistics struct {
 	// PacketsRecv is the number of packets received.
 	PacketsRecv int
 
+	// PacketsExpectedRecv is the number of packets we expected to have received (i.e. that haven't yet timed out).
+	PacketsExpectedRecv int
+
 	// PacketsSent is the number of packets sent.
 	PacketsSent int
 
@@ -279,6 +289,7 @@ func (p *Pinger) updateStatistics(pkt *Packet) {
 	p.statsMu.Lock()
 	defer p.statsMu.Unlock()
 
+	p.PacketsExpectedRecv++
 	p.PacketsRecv++
 	if p.RecordRtts {
 		p.rtts = append(p.rtts, pkt.Rtt)
@@ -536,6 +547,7 @@ func (p *Pinger) Statistics() *Statistics {
 	s := Statistics{
 		PacketsSent:           sent,
 		PacketsRecv:           p.PacketsRecv,
+		PacketsExpectedRecv:   p.PacketsExpectedRecv,
 		PacketsRecvDuplicates: p.PacketsRecvDuplicates,
 		PacketLoss:            loss,
 		Rtts:                  p.rtts,
@@ -710,7 +722,8 @@ func (p *Pinger) sendICMP(conn packetConn) error {
 	if err != nil {
 		return fmt.Errorf("unable to marshal UUID binary: %w", err)
 	}
-	t := append(timeToBytes(time.Now()), uuidEncoded...)
+	now := time.Now()
+	t := append(timeToBytes(now), uuidEncoded...)
 	if remainSize := p.Size - timeSliceLength - trackerLength; remainSize > 0 {
 		t = append(t, bytes.Repeat([]byte{1}, remainSize)...)
 	}
@@ -753,16 +766,32 @@ func (p *Pinger) sendICMP(conn packetConn) error {
 			handler(outPkt)
 		}
 		// mark this sequence as in-flight
-		p.awaitingSequences[currentUUID][p.sequence] = struct{}{}
+		p.awaitingSequences[currentUUID][p.sequence] = now
 		p.PacketsSent++
 		p.sequence++
 		if p.sequence > 65535 {
 			newUUID := uuid.New()
 			p.trackerUUIDs = append(p.trackerUUIDs, newUUID)
-			p.awaitingSequences[newUUID] = make(map[int]struct{})
+			p.awaitingSequences[newUUID] = make(map[int]time.Time)
 			p.sequence = 0
 		}
 		break
+	}
+
+	// clean up old sequences
+	cutOff := now.Add(-1 * p.PacketTimeout)
+	for uuid, seqs := range p.awaitingSequences {
+		toDelete := make(map[int]struct{})
+		for seq, whenSent := range seqs {
+			if whenSent.Before(cutOff) {
+				p.logger.Debugf("haven't seen packet UUID %v sequence %v back yet :( was sent at %v, cutoff is %v", uuid, seq, whenSent, cutOff)
+				p.PacketsExpectedRecv++
+				toDelete[seq] = struct{}{}
+			}
+		}
+		for delSeq := range toDelete {
+			delete(seqs, delSeq)
+		}
 	}
 
 	return nil
